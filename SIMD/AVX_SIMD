@@ -1,0 +1,201 @@
+#include <iostream>
+#include <windows.h>
+#include <stdio.h>
+#include <typeinfo>
+#include <stdlib.h>
+#include <tmmintrin.h>
+#include <xmmintrin.h>
+#include <emmintrin.h>
+#include <pmmintrin.h>
+#include <smmintrin.h>
+#include <nmmintrin.h>
+#include <immintrin.h>
+
+using namespace std;
+
+#define N 2000
+float** align_m = NULL;  // Aligned matrix
+float** unalign = NULL;  // Unaligned matrix
+
+// Initialize unaligned matrix
+void unalign_init() {     
+    unalign = new float*[N];
+    for (int i = 0; i < N; i++) {
+        unalign[i] = new float[N];
+    }
+    for (int i = 0; i < N; i++) {
+        unalign[i][i] = 1.0;
+        for (int j = i + 1; j < N; j++) {
+            unalign[i][j] = rand() % 1000;
+        }
+    }
+    for (int k = 0; k < N; k++) {
+        for (int i = k + 1; i < N; i++) {
+            for (int j = 0; j < N; j++) {
+                unalign[i][j] += unalign[k][j];
+                unalign[i][j] = (int)unalign[i][j] % 1000;
+            }
+        }
+    }
+}
+
+// Delete unaligned matrix
+void deleteUnalign() {
+    for (int i = 0; i < N; i++) {
+        delete[] unalign[i];
+    }
+    delete unalign;
+}
+
+// Initialize aligned matrix
+void align_init(int alignment) {
+    if (align_m == NULL) {
+        align_m = (float**)_aligned_malloc(sizeof(float*) * N, alignment);
+        for (int i = 0; i < N; i++) {
+            align_m[i] = (float*)_aligned_malloc(sizeof(float) * N, alignment);
+        }
+    }
+    for (int i = 0; i < N; i++) {
+        align_m[i][i] = 1.0; // Initialize aligned matrix
+        for (int j = i + 1; j < N; j++) {
+            align_m[i][j] = rand() % 1000;
+        }
+    }
+    for (int k = 0; k < N; k++) {
+        for (int i = k + 1; i < N; i++) {
+            for (int j = 0; j < N; j++) {
+                align_m[i][j] += align_m[k][j];
+                align_m[i][j] = (int)align_m[i][j] % 1000;
+            }
+        }
+    }
+}
+
+// Print matrix
+void print(float **a) {
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            cout << a[i][j] << " ";
+        }
+        cout << endl;
+    }
+}
+
+// Standard LU decomposition
+void LU(float **m) {
+    for (int k = 0; k < N; k++) {
+        for (int j = k + 1; j < N; j++) {
+            m[k][j] = m[k][j] / m[k][k];
+        }
+        m[k][k] = 1.0;
+        for (int i = k + 1; i < N; i++) {
+            for (int j = k + 1; j < N; j++) {
+                m[i][j] = m[i][j] - m[i][k] * m[k][j];
+            }
+            m[i][k] = 0;
+        }
+    }
+}
+
+// AVX optimized LU decomposition for unaligned matrix
+void avx_optimized(float **m) {
+    for (int k = 0; k < N; k++) {
+        __m256 t1 = _mm256_set1_ps(m[k][k]);
+        int j = 0;
+        for (j = k + 1; j + 8 <= N; j += 8) {
+            __m256 t2 = _mm256_loadu_ps(&m[k][j]);
+            t2 = _mm256_div_ps(t2, t1);
+            _mm256_storeu_ps(&m[k][j], t2);
+        }
+        for (; j < N; j++) {
+            m[k][j] = m[k][j] / m[k][k];
+        }
+        m[k][k] = 1.0;
+        for (int i = k + 1; i < N; i++) {
+            __m256 vik = _mm256_set1_ps(m[i][k]);
+            for (j = k + 1; j + 8 <= N; j += 8) {
+                __m256 vkj = _mm256_loadu_ps(&m[k][j]);
+                __m256 vij = _mm256_loadu_ps(&m[i][j]);
+                __m256 vx = _mm256_mul_ps(vik, vkj);
+                vij = _mm256_sub_ps(vij, vx);
+                _mm256_storeu_ps(&m[i][j], vij);
+            }
+            for (; j < N; j++) {
+                m[i][j] = m[i][j] - m[i][k] * m[k][j];
+            }
+            m[i][k] = 0;
+        }
+    }
+}
+
+// AVX optimized LU decomposition for aligned matrix
+void avx_align(float** m) {
+    for (int k = 0; k < N; k++) {
+        __m256 t1 = _mm256_set1_ps(m[k][k]);
+        int j = k+1;
+        while ((int)(&m[k][j]) % 32) {
+            m[k][j] = m[k][j] / m[k][k];
+            j++;
+        }
+        for (; j + 8 <= N; j += 8) {
+            __m256 t2 = _mm256_load_ps(&m[k][j]);
+            t2 = _mm256_div_ps(t2, t1);
+            _mm256_store_ps(&m[k][j], t2);
+        }
+        for (; j < N; j++) {
+            m[k][j] = m[k][j] / m[k][k];
+        }
+        m[k][k] = 1.0;
+        for (int i = k + 1; i < N; i++) {
+            __m256 vik = _mm256_set1_ps(m[i][k]);
+            j = k + 1;
+            while ((int)(&m[k][j]) % 32) {
+                m[i][j] = m[i][j] - m[i][k] * m[k][j];
+                j++;
+            }
+            for (; j + 8 <= N; j += 8) {
+                __m256 vkj = _mm256_load_ps(&m[k][j]);
+                __m256 vij = _mm256_loadu_ps(&m[i][j]);
+                __m256 vx = _mm256_mul_ps(vik, vkj);
+                vij = _mm256_sub_ps(vij, vx);
+                _mm256_storeu_ps(&m[i][j], vij);
+            }
+            for (; j < N; j++) {
+                m[i][j] = m[i][j] - m[i][k] * m[k][j];
+            }
+            m[i][k] = 0;
+        }
+    }
+}
+
+int main() {
+    long long head, tail, freq;
+    QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
+
+    // Measure time for standard LU decomposition
+    unalign_init();
+    QueryPerformanceCounter((LARGE_INTEGER*)&head);
+    LU(unalign);
+    QueryPerformanceCounter((LARGE_INTEGER*)&tail);
+    cout << "LU time: " << (tail - head) * 1000 / freq << "ms" << endl;
+    cout << "------------------" << endl;
+    deleteUnalign();
+         
+    // Measure time for AVX optimized LU decomposition on unaligned matrix
+    unalign_init();
+    QueryPerformanceCounter((LARGE_INTEGER*)&head);
+    avx_optimized(unalign);
+    QueryPerformanceCounter((LARGE_INTEGER*)&tail);
+    cout << "avx (unaligned) time: " << (tail - head) * 1000 / freq << "ms" << endl;
+    cout << "------------------" << endl;
+    deleteUnalign();
+
+    // Measure time for AVX optimized LU decomposition on aligned matrix
+    align_init(32);  // AVX requires 32-byte alignment
+    QueryPerformanceCounter((LARGE_INTEGER*)&head);
+    avx_align(align_m);
+    QueryPerformanceCounter((LARGE_INTEGER*)&tail);
+    cout << "avx (aligned) time: " << (tail - head) * 1000 / freq << "ms" << endl;
+
+    return 0;
+}
