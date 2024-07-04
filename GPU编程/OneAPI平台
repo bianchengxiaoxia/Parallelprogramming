@@ -1,0 +1,146 @@
+#include <iostream>
+#include <fstream>
+#include <chrono>
+#include <ratio>
+#include <iomanip>
+#include <random>
+#include <thread>
+#include <functional>
+#include <CL/sycl.hpp>
+
+using namespace cl::sycl;
+
+// Function to print the matrix
+void print(buffer<float, 2>& buf) {
+    host_accessor m{ buf, read_only }; // Create a host accessor for read-only access
+    auto range = m.get_range();        // Get the range (dimensions) of the buffer
+    for (int i = 0; i < range[0]; i++) {
+        for (int j = 0; j < range[1]; j++) {
+            std::cout << std::setw(16) << m[i][j]; // Print each element with a width of 16
+        }
+        std::cout << std::endl;
+    }
+}
+
+// Function to copy one matrix buffer to another
+void matrix_copy(buffer<float, 2>& to, buffer<float, 2>& from) {
+    host_accessor src{ from, read_only };   // Source buffer accessor for read-only
+    host_accessor des{ to, write_only };    // Destination buffer accessor for write-only
+    assert(src.get_range() == des.get_range()); // Ensure both buffers have the same dimensions
+    auto range = src.get_range();
+    for (int i = 0; i < range[0]; i++) {
+        for (int j = 0; j < range[1]; j++) {
+            des[i][j] = src[i][j]; // Copy each element from source to destination
+        }
+    }
+}
+
+// Function to initialize the matrix with random values and some specific pattern
+void matrix_init(buffer<float, 2>& buf) {
+    host_accessor A{ buf, read_write }; // Create a host accessor for read-write access
+
+    static std::default_random_engine generator(1337);
+    static std::uniform_real_distribution<float> distribution(-1.0, 1.0);
+
+    int N = A.get_range()[0]; // Get the dimension of the matrix
+    for (int i = 0; i < N; i++) {
+        A[i][i] = 1.0; // Set the diagonal elements to 1.0
+        for (int j = i + 1; j < N; j++) {
+            A[i][j] = rand() % 5000; // Set upper triangular elements to random values
+        }
+    }
+    for (int k = 0; k < N; k++) {
+        for (int i = k + 1; i < N; i++) {
+            for (int j = 0; j < N; j++) {
+                A[i][j] += A[k][j];
+                A[i][j] = static_cast<int>(A[i][j]) % 5000;
+            }
+        }
+    }
+}
+
+// Standard LU decomposition function
+void LU(buffer<float, 2>& buf, queue& q) {
+    host_accessor m{ buf, read_write }; // Create a host accessor for read-write access
+    int n = m.get_range()[0]; // Get the dimension of the matrix
+    for (int k = 0; k < n; k++) {
+        for (int j = k + 1; j < n; j++) {
+            m[k][j] = m[k][j] / m[k][k]; // Normalize the current row
+        }
+        m[k][k] = 1.0; // Set the pivot element to 1.0
+        for (int i = k + 1; i < n; i++) {
+            for (int j = k + 1; j < n; j++) {
+                m[i][j] = m[i][j] - m[i][k] * m[k][j]; // Eliminate the current column
+            }
+            m[i][k] = 0.0; // Set the element below the pivot to 0
+        }
+    }
+}
+
+// LU decomposition function optimized with SYCL
+void Lu_oneapi(buffer<float, 2>& buf, queue& q) {
+    int n = buf.get_range()[0]; // Get the dimension of the matrix
+    for (int k = 0; k < n; k++) {
+        // Step 1: Normalize the current row using parallel_for
+        q.submit([&](handler& h) {
+            accessor m{ buf, h, read_write };
+            h.parallel_for(range(n - k), [=](auto idx) {
+                int j = k + idx;
+                m[k][j] = m[k][j] / m[k][k];
+            });
+        });
+
+        // Step 2: Eliminate the current column using parallel_for
+        q.submit([&](handler& h) {
+            accessor m{ buf, h, read_write };
+            h.parallel_for(range(n - (k + 1), n - (k + 1)), [=](auto idx) {
+                int i = k + 1 + idx.get_id(0);
+                int j = k + 1 + idx.get_id(1);
+                m[i][j] = m[i][j] - m[i][k] * m[k][j];
+            });
+        });
+
+        // Step 3: Set the element below the pivot to 0 using parallel_for
+        q.submit([&](handler& h) {
+            accessor m{ buf, h, read_write };
+            h.parallel_for(range(n - (k + 1)), [=](auto idx) {
+                int i = k + 1 + idx;
+                m[i][k] = 0.0;
+            });
+        });
+    }
+    q.wait(); // Wait for all submitted tasks to complete
+}
+
+// Function to test the LU decomposition
+void test(int n, queue& q) {
+    buffer<float, 2> buf1(range(n, n)); // Buffer for the standard LU decomposition
+    buffer<float, 2> buf2(range(n, n)); // Buffer for the SYCL optimized LU decomposition
+
+    matrix_init(buf1);  // Initialize the matrix
+    matrix_copy(buf2, buf1); // Copy the matrix for comparison
+
+    auto start = std::chrono::high_resolution_clock::now();
+    LU(buf1, q); // Perform standard LU decomposition
+    auto end = std::chrono::high_resolution_clock::now();
+    double time_ordinary = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    std::cout << "Ordinary LU decomposition time: " << time_ordinary << " ms" << std::endl;
+
+    start = std::chrono::high_resolution_clock::now();
+    Lu_oneapi(buf2, q); // Perform SYCL optimized LU decomposition
+    end = std::chrono::high_resolution_clock::now();
+    double time_oneapi = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    std::cout << "OneAPI LU decomposition time: " << time_oneapi << " ms" << std::endl;
+}
+
+int main() {
+    // Select the GPU device
+    queue q(gpu_selector{});
+    device my_device = q.get_device();
+    std::cout << "Device: " << my_device.get_info<info::device::name>() << std::endl;
+
+    int n = 512; // Size of the matrix
+    test(n, q);  // Run the test
+
+    return 0;
+}
