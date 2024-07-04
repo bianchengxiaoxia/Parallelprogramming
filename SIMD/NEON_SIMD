@@ -1,0 +1,157 @@
+#include <iostream>
+#include <time.h>
+#include <arm_neon.h>
+
+using namespace std;
+
+#define N 1000
+
+float m[N][N];  // 主矩阵
+float **a;      // 用于操作的辅助矩阵
+
+// 初始化主矩阵
+void m_reset() {
+    for (int i = 0; i < N; i++) {
+        m[i][i] = 1.0;
+        for (int j = i + 1; j < N; j++) {
+            m[i][j] = rand() % 1000;
+        }
+    }
+    for (int k = 0; k < N; k++) {
+        for (int i = k + 1; i < N; i++) {
+            for (int j = 0; j < N; j++) {
+                m[i][j] += m[k][j];
+                m[i][j] = (int)m[i][j] % 1000;
+            }
+        }
+    }
+}
+
+// 复制矩阵
+void copyMatrix(float** a, float m[N][N]) {
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            a[i][j] = m[i][j];
+        }
+    }
+}
+
+// 删除矩阵
+void deleteMatrix(float** a) {
+    for (int i = 0; i < N; i++) {
+        delete[] a[i];
+    }
+    delete a;
+}
+
+// 打印矩阵
+void print() {
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            cout << m[i][j] << " ";
+        }
+        cout << endl;
+    }
+}
+
+// 标准LU分解算法
+void LU(float** m) {
+    for (int k = 0; k < N; k++) {
+        for (int j = k + 1; j < N; j++) {
+            m[k][j] = m[k][j] / m[k][k];
+        }
+        m[k][k] = 1.0;
+        for (int i = k + 1; i < N; i++) {
+            for (int j = k + 1; j < N; j++) {
+                m[i][j] = m[i][j] - m[i][k] * m[k][j];
+            }
+            m[i][k] = 0;
+        }
+    }
+}
+
+// NEON优化的LU分解算法
+void neon_optimized(float** m) {
+    for (int k = 0; k < N; k++) {
+        float32x4_t vt = vdupq_n_f32(m[k][k]);
+        int j = 0;
+        for (j = k + 1; j + 4 <= N; j += 4) {
+            float32x4_t va = vld1q_f32(&m[k][j]);
+            va = vdivq_f32(va, vt);
+            vst1q_f32(&m[k][j], va);
+        }
+        for (; j < N; j++) {
+            m[k][j] = m[k][j] / m[k][k];
+        }
+        m[k][k] = 1.0;
+        for (int i = k + 1; i < N; i++) {
+            float32x4_t vaik = vdupq_n_f32(m[i][k]);
+            for (j = k + 1; j + 4 <= N; j += 4) {
+                float32x4_t vakj = vld1q_f32(&m[k][j]);
+                float32x4_t vaij = vld1q_f32(&m[i][j]);
+                float32x4_t vx = vmulq_f32(vakj, vaik);
+                vaij = vsubq_f32(vaij, vx);
+                vst1q_f32(&m[i][j], vaij);
+            }
+            for (; j < N; j++) {
+                m[i][j] = m[i][j] - m[i][k] * m[k][j];
+            }
+            m[i][k] = 0;
+        }
+    }
+}
+
+int main() {
+    // 初始化矩阵
+    m_reset();
+
+    // 分配辅助矩阵的内存
+    a = new float*[N];
+    for (int i = 0; i < N; i++) {
+        a[i] = new float[N];
+    }
+
+    // 复制主矩阵到辅助矩阵
+    copyMatrix(a, m);
+
+    // 记录开始时间
+    struct timespec sts, ets;
+    timespec_get(&sts, TIME_UTC);
+
+    // 执行标准LU分解
+    LU(a);
+
+    // 记录结束时间
+    timespec_get(&ets, TIME_UTC);
+    time_t dsec = ets.tv_sec - sts.tv_sec;
+    long dnsec = ets.tv_nsec - sts.tv_nsec;
+    if (dnsec < 0) {
+        dsec--;
+        dnsec += 1000000000ll;
+    }
+    printf("平凡算法耗时： %ld.%09lds\n", dsec, dnsec);
+
+    // 复制主矩阵到辅助矩阵
+    copyMatrix(a, m);
+
+    // 记录开始时间
+    timespec_get(&sts, TIME_UTC);
+
+    // 执行NEON优化的LU分解
+    neon_optimized(a);
+
+    // 记录结束时间
+    timespec_get(&ets, TIME_UTC);
+    dsec = ets.tv_sec - sts.tv_sec;
+    dnsec = ets.tv_nsec - sts.tv_nsec;
+    if (dnsec < 0) {
+        dsec--;
+        dnsec += 1000000000ll;
+    }
+    printf("NEON优化后耗时： %ld.%09lds\n", dsec, dnsec);
+
+    // 释放辅助矩阵的内存
+    deleteMatrix(a);
+
+    return 0;
+}
